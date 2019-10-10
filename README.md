@@ -8,7 +8,7 @@ To mitigate the impact, the node will be drained via the `asinfo -v quiesce` com
 
 # Requirements
 
-python requests 2.20.1  
+python requests 2.20.1
 asinfo (from aerospike-tools)
 
 
@@ -19,13 +19,13 @@ This script should run on every Aerospike node, as maintenance events are local 
 run with nohup:
 
 ```
-nohup ./maintenance.py & 
+nohup ./maintenance.py &
 ```
 
 # Parameters:
 
 ```
-usage: maintenance.py [-h] [-o OPTIONS]
+usage: maintenance.py [-h] [-o OPTIONS] [-t TIMEOUT] [-p | -n]
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -33,11 +33,17 @@ optional arguments:
                         Additional options to pass into asinfo. Can be
                         anything except commands, ie: "-v $COMMAND". Entire
                         string must be quoted, eg: -o="-u admin -p admin"
+  -t TIMEOUT, --timeout TIMEOUT
+                        Timeout for the Google metadata service in seconds, up
+                        to 3600 (default 3600)
+  -p, --persist         Persist the last event to file
+  -n, --non-persist     Disable persist the last event to file (default)
+
 ```
 
 
 Example with user/password:
 
 ```
-nohup ./maintenance.py -o="-u admin -p admin" & 
+nohup ./maintenance.py -o="-u admin -p admin" &
 ```

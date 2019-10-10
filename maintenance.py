@@ -23,6 +23,7 @@ For more information, see the README.md under /compute.
 
 import argparse
 import time
+import os
 
 import requests
 import logging
@@ -35,6 +36,12 @@ ASINFO = "/usr/bin/asinfo"
 ASADM = "/usr/bin/asadm"
 AGM_LOG = "/var/log/aerospike/agm.log"
 AGM_LEVEL = logging.INFO
+# Timeout in seconds, up to 3600 (which is google max timeout)
+MAX_TIMEOUT = 3600
+
+# persist status over runs
+is_persistent_last_event = False  # the default set at the parser
+AS_TMP_LAST_STATUS_FILE = '/tmp/agm_last_status.tmp'
 
 # logger setup
 logging.basicConfig()
@@ -55,10 +62,57 @@ parser.add_argument("-o",
                     default = "",
                     help = "Additional options to pass into asinfo. Can be anything except commands, ie: \"-v $COMMAND\". Entire string must be quoted, eg: -o=\"-u admin -p admin\"")
 
+parser.add_argument("-t",
+                    "--timeout",
+                    type=int,
+                    dest="timeout",
+                    default=3600,
+                    help="Timeout for the Google metadata service in seconds, up to 3600 (default 3600)")
+
+feature_parser = parser.add_mutually_exclusive_group(required=False)
+feature_parser.add_argument("-p",
+                    "--persist",
+                    dest="is_persistent_last_event",
+                    action="store_true",
+                    help="Persist the last event to file")
+
+feature_parser.add_argument("-n",
+                    "--non-persist",
+                    dest="is_persistent_last_event",
+                    action="store_false",
+                    help="Disable persist the last event to file (default)")
+
+parser.set_defaults(is_persistent_last_event=False)
 args = parser.parse_args()
 
 logger.debug('options: %s', args.options)
+logger.debug('is_persistent_last_event: %s', args.is_persistent_last_event)
+logger.debug('max_timeout: %s', args.timeout)
 
+is_persistent_last_event = args.is_persistent_last_event
+MAX_TIMEOUT = args.timeout
+
+# Persist status over runs
+def set_last_maintenance_event(last_maintenance_event):
+    try:
+        with open(AS_TMP_LAST_STATUS_FILE, 'w') as tmpfile:
+            tmpfile.write(str(last_maintenance_event))
+    except IOError as e:
+        logger.error('Could not open %s for writing: %s', AS_TMP_LAST_STATUS_FILE, str(e))
+
+def get_last_maintenance_event():
+
+    if not os.path.isfile(AS_TMP_LAST_STATUS_FILE):
+        return "NONE"
+
+    try:
+        with open(AS_TMP_LAST_STATUS_FILE, 'r') as tmpfile:
+            last_status = tmpfile.read()
+            return last_status
+
+    except IOError as e:
+        logger.error("Could not open %s for reading: %s", AS_TMP_LAST_STATUS_FILE, str(e))
+        return "NONE"
 
 # Run shell command and check success or failure.
 def run_shell_command(command):
@@ -70,7 +124,7 @@ def run_shell_command(command):
         return
 
     if stdout:
-        logger.debug("Command: \"" + " ".join(command) + "\" Output: \n" + stdout)
+        logger.info("Command: \"" + " ".join(command) + "\" Output: \n" + stdout)
 
     if p.returncode != 0:
         logger.error("Command: \"" + " ".join(command) + "\" returned with error code: " + str(p.returncode))
@@ -80,7 +134,11 @@ def run_shell_command(command):
 
 def wait_for_maintenance(callback):
     url = METADATA_URL + 'instance/maintenance-event'
-    last_maintenance_event = None
+    if is_persistent_last_event:
+        last_maintenance_event = get_last_maintenance_event()
+    else:
+        last_maintenance_event = "NONE"
+
     # [START hanging_get]
     last_etag = '0'
 
@@ -89,9 +147,9 @@ def wait_for_maintenance(callback):
         try:
             r = requests.get(
                 url,
-                params={'last_etag': last_etag, 'wait_for_change': True},
+                params={'last_etag': last_etag, 'wait_for_change': True, 'timeout_sec': MAX_TIMEOUT},
                 headers=METADATA_HEADERS)
-            logger.info("agm status change, running... new status code: %s. text: %s", r.status_code, r.text.encode('utf-8').strip())
+            logger.info("Google Metadata returned with status code: %s. text: %s", r.status_code, r.text.encode('utf-8').strip())
 
         except requests.exceptions.TooManyRedirects as tmr:
             # A request exceeds the configured number of maximum redirections, stop script
@@ -100,7 +158,7 @@ def wait_for_maintenance(callback):
             raise tmr
 
         except requests.exceptions.RequestException as re:
-            # Retry for all other errors (ConnectionError, Timeout ..). 
+            # Retry for all other errors (ConnectionError, Timeout ..).
             # The check for 503 and raise_for_status() - 4XX and 5XX will be done separately.
             # https://2.python-requests.org//en/latest/user/quickstart/#errors-and-exceptions
             logger.error("Request Exception %s, Retrying....", str(re))
@@ -125,21 +183,29 @@ def wait_for_maintenance(callback):
         # [END hanging_get]
 
         if r.text == 'NONE':
-            maintenance_event = None
+            maintenance_event = 'NONE'
         else:
             # Possible events:
             #   MIGRATE_ON_HOST_MAINTENANCE: instance will be migrated
             #   TERMINATE_ON_HOST_MAINTENANCE: instance will be shut down
-            maintenance_event = r.text
+            maintenance_event = r.text.encode('utf-8').strip()
+
+        if is_persistent_last_event:
+            last_maintenance_event = get_last_maintenance_event()
 
         if maintenance_event != last_maintenance_event:
+            logger.info("Maintenance event changed from %s to %s", last_maintenance_event, maintenance_event)
             last_maintenance_event = maintenance_event
+            if is_persistent_last_event:
+                set_last_maintenance_event(last_maintenance_event)
+
             callback(maintenance_event)
 
+
 def maintenance_callback(event):
-    if event:
+    if event != "NONE":
         logger.warning('Undergoing host maintenance: %s', event)
-        # realistically, any sort of maintenence event should drain aerospike
+        # realistically, any sort of maintenance event should drain aerospike
         asinfo = [ASINFO, "-v", "quiesce:"]
         asinfo.extend(args.options.split())
         run_shell_command(asinfo)
